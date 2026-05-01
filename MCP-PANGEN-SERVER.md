@@ -46,20 +46,28 @@ MCP Pangen Server 是一个 MCP（Model Context Protocol）服务器，用于将
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-**职责分工**：
-- **MCP Server**：Job 管理、配置管理、执行 Pangen 命令、返回数值指标
-- **GPU Cluster**：运行 Pangen 的服务器集群，MCP Server 通过 SSH 访问
-- **RAG Server**：Claude Code 直接访问，获取 Pangen 文档和历史调参经验
-- **Claude Code**：协调者，结合 MCP 结果和 RAG 知识做决策
-
 ### 1.2 组件职责
 
-| 组件                      | 职责                                                |
-| ------------------------- | --------------------------------------------------- |
-| **Claude Code / Lattice** | AI Agent，通过 MCP 协议调用工具                     |
-| **RAG Server**            | 向量知识库，Claude Code 直接连接，MCP Server 不感知 |
-| **MCP Pangen Server**     | 工具执行、Job 管理、配置管理、确认网关              |
-| **GPU Cluster**           | 运行 Pangen 的服务器集群，通过 SSH 访问             |
+| 组件                      | 职责                                                           |
+| ------------------------- | -------------------------------------------------------------- |
+| **Claude Code / Lattice** | AI Agent，通过 MCP 协议调用工具，结合 RAG 知识做决策           |
+| **RAG Server**            | 向量知识库，Claude Code 直接连接，MCP Server 不感知            |
+| **GPU Cluster**           | 运行 Pangen 的服务器集群，MCP Server 通过 SSH 访问             |
+| **MCP Pangen Server**     | MCP 协议处理、Job 管理、配置管理、结果分析、调参优化、确认网关 |
+
+MCP Pangen Server 内部各模块职责如下：
+
+| 模块                   | 职责                                                                  |
+| ---------------------- | --------------------------------------------------------------------- |
+| **MCP Protocol Layer** | JSON-RPC 通信，处理 `tools/list`、`tools/call` 请求，暴露 Resources   |
+| **Job Manager**        | Job 生命周期管理：submit/status/list/cancel/result/logs               |
+| **Config Manager**     | 配置文件读写、验证、管理多配置模板                                    |
+| **Confirmation Gate**  | 高风险操作前暂停，等待用户确认（脚本执行/敏感操作/长时 Job）          |
+| **Pangen Interface**   | SSH 命令执行、流式 log 读取、结果文件元信息读取                       |
+| **Result Analyzer**    | 解析二进制结果，提取数值指标（CD 误差、良率等），生成结构化报告       |
+| **Parameter Tuner**    | 调参策略引擎，根据历史结果生成配置建议，记录调参历史                  |
+| **Task Manager**       | 迭代优化任务管理：创建/追踪/暂停/恢复/终止任务，维护 job 链和调参历史 |
+| **Local Storage**      | 状态文件（Job/Task）、配置模板、调参策略、MCP 服务器自身日志的持久化  |
 
 ---
 
@@ -109,6 +117,16 @@ MCP 协议层，处理 JSON-RPC 通信：
   "exit_code": null
 }
 ```
+
+**状态文件更新机制**：
+
+Job 运行期间，Job Manager 持续轮询 GPU 服务器上的进程状态（通过 SSH 执行 `ps -p {pid} -o stat=` 或读取 GPU 服务器上的状态文件），并同步更新本地状态文件。更新流程如下：
+
+1. 通过 SSH 读取 GPU 上进程/Pangen 的实时状态（如 `progress`、`exit_code`）
+2. 将最新状态写入本地 `~/.pangen-mcp/jobs/{job_id}.json`
+3. 更新采用原子写入（写临时文件 → 替换原文件），避免并发写入导致文件损坏
+
+Job Manager 同时是状态文件的**写入方**，Claude Code 通过 `job_status` 接口读取文件内容作为返回结果。
 
 ### 2.3 Config Manager（配置管理模块）
 
@@ -202,6 +220,9 @@ Job 完成后，分析 Pangen 的输出结果，提取数值指标。
 - 根据历史 job 结果，选择合适的调整方向
 - 生成新的配置参数（不直接写入，需要确认）
 - 记录调参历史，用于策略学习
+- 将调参结果（配置/结果/决策）写入 RAG 知识库，供后续任务复用
+
+**经验固化**：每次 Task 完成后，Claude Code 将成功/失败的调参路径（如 CD_error 1.2→0.7 的参数调整过程）整理成案例，写入 RAG 或封装为 Skill，固化到知识体系中。下次遇到相似场景时，RAG 可直接检索历史经验，缩短调参周期。
 
 **调参策略示例**：
 
@@ -335,13 +356,14 @@ Claude Code:
   2. 调用 job_submit() 提交 job
   3. 轮询 job_status() 直到完成
   4. 调用 analyze_result() 获取分析报告（数值指标）
-  5. 调用 RAG 知识库查询类似案例
+  5. 调用 RAG 知识库查询类似案例（可利用历史固化经验快速定位方向）
   6. 结合两者决定下一步：
      - 如果未达标且未达上限：调用 tune_params() 获取调参建议
      - 如果达标或已达上限：停止迭代
   7. 调用 config_set() 应用新配置
   8. 重复 2-7 直到结束
   9. 调用 task_result() 获取最终报告
+ 10. 将本次调参路径（成功或失败）写入 RAG / 封装为 Skill，固化经验
 ```
 
 ```
@@ -591,6 +613,17 @@ RAG 作为独立服务，Claude Code 直接访问，MCP Server 不感知。
 - 根据 `analyze_result()` 返回的数值指标，结合 RAG 进行模糊判断
 - 查询类似问题的历史调参经验
 - 获取调参策略建议
+
+### 9.1 经验固化
+
+Claude Code 在每次调参任务中积累的经验通过以下两种方式固化：
+
+| 方式             | 说明                                                                 | 适用场景                      |
+| ---------------- | -------------------------------------------------------------------- | ----------------------------- |
+| **RAG 案例写入** | 将成功/失败的调参路径（配置变更 → 结果指标）整理为检索文档，写入 RAG | 跨 session 复用、历史经验检索 |
+| **封装为 Skill** | 将重复有效的调参模式封装为 Skill（如"收敛慢 → 网格细化"策略）        | 快速复用、同类问题批量处理    |
+
+固化后的经验可被后续 Task 直接复用，减少重复试错，缩短调参周期。
 
 ---
 
